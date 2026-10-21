@@ -30,4 +30,4 @@ test:
 	./build/firmware-test
 
 clean:
-	rm -f build/rail-teleop.elf build/config.h build/motion-test build/motion-test-unit build/firmware-test
+	rm -rf build 
