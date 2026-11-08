@@ -39,8 +39,18 @@ void board_init(void)
     gpio.Pin = BOARD_HARD_LIMIT_PIN;
     HAL_GPIO_Init(BOARD_HARD_LIMIT_GPIO_PORT, &gpio);
 
-    gpio.Pin = BOARD_OPTICAL_MIN_PIN;
-    HAL_GPIO_Init(BOARD_OPTICAL_MIN_GPIO_PORT, &gpio);
+    gpio.Pin = BOARD_HOME_SWITCH_PIN;
+    HAL_GPIO_Init(BOARD_HOME_SWITCH_GPIO_PORT, &gpio);
+
+    /* The optical gates drive SIG themselves (low idle, high triggered), so a
+       disconnected or dead sensor must read as clear, not as whatever the
+       input happens to float to. */
+    gpio.Pull = GPIO_PULLDOWN;
+    gpio.Pin = BOARD_GATE_HOME_PIN;
+    HAL_GPIO_Init(BOARD_GATE_HOME_GPIO_PORT, &gpio);
+
+    gpio.Pin = BOARD_GATE_FAR_PIN;
+    HAL_GPIO_Init(BOARD_GATE_FAR_GPIO_PORT, &gpio);
 }
 
 bool board_hard_limits_ok(void)
@@ -55,8 +65,20 @@ bool board_estop_ok(void)
                             BOARD_ESTOP_PIN) == GPIO_PIN_RESET;
 }
 
-bool board_optical_min_active(void)
+bool board_home_switch_active(void)
 {
-    return HAL_GPIO_ReadPin(BOARD_OPTICAL_MIN_GPIO_PORT,
-                            BOARD_OPTICAL_MIN_PIN) == GPIO_PIN_RESET;
+    return HAL_GPIO_ReadPin(BOARD_HOME_SWITCH_GPIO_PORT,
+                            BOARD_HOME_SWITCH_PIN) == GPIO_PIN_RESET;
+}
+
+bool board_gate_home_active(void)
+{
+    return HAL_GPIO_ReadPin(BOARD_GATE_HOME_GPIO_PORT,
+                            BOARD_GATE_HOME_PIN) == GPIO_PIN_SET;
+}
+
+bool board_gate_far_active(void)
+{
+    return HAL_GPIO_ReadPin(BOARD_GATE_FAR_GPIO_PORT,
+                            BOARD_GATE_FAR_PIN) == GPIO_PIN_SET;
 }

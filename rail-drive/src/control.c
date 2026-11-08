@@ -8,7 +8,9 @@
 #include "uart.h"
 
 #define HOST_TIMEOUT_MS 50U
-#define CALIBRATION_TIMEOUT_MS 90000U
+/* Worst case is a full-length seek at CAL_VEL (420mm / 2mm/s = 210s) plus
+   back-off and brake; 90s was too short for the flat slow-speed cal policy. */
+#define CALIBRATION_TIMEOUT_MS 270000U
 #define FEEDBACK_TIMEOUT_MS 10U
 #define OPTICAL_DEBOUNCE_CYCLES 5U
 #define TWO_PI 6.28318530718f
@@ -67,10 +69,19 @@ static uint32_t last_host_tick;
 static uint32_t calibration_start_tick;
 static ak60_state_t motor;
 
-static bool optical_candidate;
-static bool optical_stable;
-static float optical_clear_position_mm;
-static uint8_t optical_count;
+static bool home_switch_candidate;
+static bool home_switch_stable;
+static float home_clear_position_mm;
+static uint8_t home_switch_count;
+
+static bool gate_home_candidate;
+static bool gate_home_stable;
+static uint8_t gate_home_count;
+static bool gate_far_candidate;
+static bool gate_far_stable;
+static uint8_t gate_far_count;
+static bool beyond_home_gate;
+static bool beyond_far_gate;
 
 static protocol_response_type_t fault_response(drive_fault_t reason)
 {
@@ -115,29 +126,64 @@ static void begin_stop(drive_fault_t reason)
     calibration_error_pending = false;
 }
 
-static void update_optical_switch(void)
+static void update_home_switch(void)
 {
-    bool sample = board_optical_min_active();
-    if (sample == optical_candidate)
+    bool sample = board_home_switch_active();
+    if (sample == home_switch_candidate)
     {
-        if (optical_count < OPTICAL_DEBOUNCE_CYCLES)
+        if (home_switch_count < OPTICAL_DEBOUNCE_CYCLES)
         {
-            optical_count++;
+            home_switch_count++;
         }
     }
     else
     {
-        optical_candidate = sample;
-        optical_count = 1U;
+        home_switch_candidate = sample;
+        home_switch_count = 1U;
         if (!sample)
         {
             /* Keep the edge position if this clear interval is confirmed. */
-            optical_clear_position_mm = position_mm;
+            home_clear_position_mm = position_mm;
         }
     }
-    if (optical_count >= OPTICAL_DEBOUNCE_CYCLES)
+    if (home_switch_count >= OPTICAL_DEBOUNCE_CYCLES)
     {
-        optical_stable = optical_candidate;
+        home_switch_stable = home_switch_candidate;
+    }
+}
+
+/*
+ * Tracks which side of an optical gate the carriage is on. "Beyond" means
+ * past the gate, in the slow zone toward that end. The side only changes
+ * when the debounced flag leaves the slot, and it is decided by the
+ * direction of travel at that moment, so reversing inside the slot and
+ * leaving the way you came in is handled correctly.
+ */
+static void update_gate(bool sample, bool *candidate, uint8_t *count,
+                        bool *stable, bool *beyond, float end_sign)
+{
+    bool was_stable = *stable;
+
+    if (sample == *candidate)
+    {
+        if (*count < OPTICAL_DEBOUNCE_CYCLES)
+        {
+            (*count)++;
+        }
+    }
+    else
+    {
+        *candidate = sample;
+        *count = 1U;
+    }
+    if (*count >= OPTICAL_DEBOUNCE_CYCLES)
+    {
+        *stable = *candidate;
+    }
+
+    if (was_stable && !*stable && velocity_mm_s != 0.0f)
+    {
+        *beyond = (velocity_mm_s * end_sign) > 0.0f;
     }
 }
 
@@ -196,7 +242,7 @@ static bool calibration_preflight_ok(uint32_t now,
     }
     if (!board_hard_limits_ok())
     {
-        *error = PROTOCOL_RESPONSE_ERR_HRD;
+        *error = PROTOCOL_RESPONSE_ERR_EST;
         return false;
     }
     if (!last_motor_tx_ok || !feedback_fresh(now))
@@ -214,6 +260,19 @@ static bool calibration_preflight_ok(uint32_t now,
 
 static float position_safe_target(float target)
 {
+    /* Gate hard stops: once past an end's gate, motion further toward that
+       end commands zero (the normal jerk-limited profile brakes to a halt
+       there, no fault). Motion back away from the end is never blocked
+       here, and cal bypasses this function entirely. */
+    if (beyond_home_gate && target < 0.0f)
+    {
+        target = 0.0f;
+    }
+    if (beyond_far_gate && target > 0.0f)
+    {
+        target = 0.0f;
+    }
+
     float candidate_velocity = command_velocity_mm_s;
     float candidate_acceleration = command_acceleration_mm_s2;
     motion_profile_step(target, &candidate_velocity, &candidate_acceleration);
@@ -251,10 +310,16 @@ static bool command_is_outward(float command)
            (command > 0.0f && position_mm >= MAX_POS - POSITION_MARGIN);
 }
 
+/* Exact-zero equality on a value that approaches zero through float jerk
+   limiting rarely lands on the exact bit pattern, so stops could hang
+   short of STATE_DEACTIVATED indefinitely. A small tolerance is the fix. */
+#define STOPPED_VELOCITY_EPS 0.0001f
+#define STOPPED_ACCEL_EPS 0.0001f
+
 static bool profile_stopped(void)
 {
-    return command_velocity_mm_s == 0.0f &&
-           command_acceleration_mm_s2 == 0.0f;
+    return fabsf(command_velocity_mm_s) < STOPPED_VELOCITY_EPS &&
+           fabsf(command_acceleration_mm_s2) < STOPPED_ACCEL_EPS;
 }
 
 static void start_calibration(uint32_t now)
@@ -264,10 +329,10 @@ static void start_calibration(uint32_t now)
     calibration_complete_pending = false;
     calibration_error_pending = false;
     calibration_start_tick = now;
-    if (optical_stable)
+    if (home_switch_stable)
     {
         calibration_phase = CAL_BACK_OFF;
-        requested_velocity_mm_s = -CAL_VEL;
+        requested_velocity_mm_s = CAL_BACKOFF_VEL;
     }
     else
     {
@@ -278,7 +343,7 @@ static void start_calibration(uint32_t now)
 
 static bool fault_can_clear(uint32_t now)
 {
-    if (!board_estop_ok() || !board_hard_limits_ok())
+    if (!board_estop_ok() || !board_hard_limits_ok() || board_home_switch_active())
     {
         return false;
     }
@@ -312,18 +377,6 @@ static void handle_request(const protocol_request_t *request, uint32_t now,
 
     if (fault != FAULT_NONE)
     {
-        if (fault == FAULT_HARD_LIMIT &&
-            request->type == PROTOCOL_REQUEST_CALIBRATE &&
-            calibration_preflight_ok(now, &response->type))
-        {
-            fault = FAULT_NONE;
-            stop_fault = FAULT_NONE;
-            command_velocity_mm_s = 0.0f;
-            command_acceleration_mm_s2 = 0.0f;
-            start_calibration(now);
-            response->type = PROTOCOL_RESPONSE_CALIBRATING;
-            return;
-        }
         if (request->type == PROTOCOL_REQUEST_DISARM && fault_can_clear(now))
         {
             fault = FAULT_NONE;
@@ -436,14 +489,14 @@ static void update_calibration(void)
         return;
     }
 
-    if (calibration_phase == CAL_SEEK_MIN && optical_stable)
+    if (calibration_phase == CAL_SEEK_MIN && home_switch_stable)
     {
         calibration_phase = CAL_BACK_OFF;
-        requested_velocity_mm_s = -CAL_VEL;
+        requested_velocity_mm_s = CAL_BACKOFF_VEL;
     }
-    else if (calibration_phase == CAL_BACK_OFF && !optical_stable)
+    else if (calibration_phase == CAL_BACK_OFF && !home_switch_stable)
     {
-        position_mm -= optical_clear_position_mm;
+        position_mm -= home_clear_position_mm;
         calibration_phase = CAL_BRAKE;
         requested_velocity_mm_s = 0.0f;
     }
@@ -485,14 +538,26 @@ static void run_control_cycle(void)
     }
     if (!board_hard_limits_ok())
     {
-        set_fault(FAULT_HARD_LIMIT);
+        /* Far switch: an E-stop-class kill in every state, same as the wired E-stop. */
+        set_fault(FAULT_ESTOP);
+    }
+    if ((state == STATE_ACTIVE || state == STATE_STOPPING) &&
+        board_home_switch_active())
+    {
+        /* Home switch: an E-stop-class kill only outside calibration, which
+           deliberately rides onto this switch to find zero. */
+        set_fault(FAULT_ESTOP);
     }
     consume_feedback(now);
     if (feedback_fresh(now) && motor.error == 0U)
     {
         position_mm += velocity_mm_s * CONTROL_PERIOD_US / 1000000.0f;
     }
-    update_optical_switch();
+    update_home_switch();
+    update_gate(board_gate_home_active(), &gate_home_candidate, &gate_home_count,
+               &gate_home_stable, &beyond_home_gate, -1.0f);
+    update_gate(board_gate_far_active(), &gate_far_candidate, &gate_far_count,
+               &gate_far_stable, &beyond_far_gate, 1.0f);
 
     if ((state == STATE_CALIBRATING || state == STATE_ACTIVE ||
          state == STATE_STOPPING) && !feedback_fresh(now))
@@ -505,9 +570,13 @@ static void run_control_cycle(void)
         handle_request(&request, now, &response);
     }
 
-    if (state == STATE_ACTIVE &&
+    if (state == STATE_ACTIVE && requested_velocity_mm_s != 0.0f &&
         now - last_host_tick >= HOST_TIMEOUT_MS)
     {
+        /* Only a host that goes silent while still commanding motion is a
+           hazard; once it has told us to hold at zero (including right
+           after calibration), losing the connection is safe to ignore so
+           the carriage can sit idle between host sessions. */
         begin_stop(FAULT_COMMUNICATION);
     }
 
@@ -595,9 +664,17 @@ void control_init(void)
 {
     state = STATE_DEACTIVATED;
     velocity_gain_kd = AK60_DEFAULT_KD;
-    optical_candidate = board_optical_min_active();
-    optical_stable = optical_candidate;
-    optical_count = OPTICAL_DEBOUNCE_CYCLES;
+    home_switch_candidate = board_home_switch_active();
+    home_switch_stable = home_switch_candidate;
+    home_switch_count = OPTICAL_DEBOUNCE_CYCLES;
+    gate_home_candidate = board_gate_home_active();
+    gate_home_stable = gate_home_candidate;
+    gate_home_count = OPTICAL_DEBOUNCE_CYCLES;
+    gate_far_candidate = board_gate_far_active();
+    gate_far_stable = gate_far_candidate;
+    gate_far_count = OPTICAL_DEBOUNCE_CYCLES;
+    beyond_home_gate = false;
+    beyond_far_gate = false;
     CoreDebug->DEMCR |= CoreDebug_DEMCR_TRCENA_Msk;
     DWT->CYCCNT = 0U;
     DWT->CTRL |= DWT_CTRL_CYCCNTENA_Msk;
