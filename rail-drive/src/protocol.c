@@ -1,6 +1,6 @@
 #include "protocol.h"
 
-#include <stdio.h>
+#include <math.h>
 #include <string.h>
 
 #include "uart.h"
@@ -101,6 +101,7 @@ bool protocol_read_request(protocol_request_t *request)
 
     request->value_mm_s = 0.0f;
     request->gain_kd = 0.0f;
+    request->result_page = '\0';
     if (strcmp(line, "cal") == 0)
     {
         request->type = PROTOCOL_REQUEST_CALIBRATE;
@@ -123,6 +124,15 @@ bool protocol_read_request(protocol_request_t *request)
     {
         request->type = PROTOCOL_REQUEST_INVALID_KD;
     }
+    else if (strcmp(line, "res") == 0)
+    {
+        request->type = PROTOCOL_REQUEST_RESULT;
+    }
+    else if (strcmp(line, "res h") == 0 || strcmp(line, "res f") == 0)
+    {
+        request->type = PROTOCOL_REQUEST_RESULT;
+        request->result_page = line[4];
+    }
     else
     {
         request->type = PROTOCOL_REQUEST_INVALID;
@@ -130,20 +140,127 @@ bool protocol_read_request(protocol_request_t *request)
     return true;
 }
 
-static void format_tenth(char *buffer, size_t size, float value)
-{
-    long tenths = (long)(value >= 0.0f ? value * 10.0f + 0.5f :
-                                      value * 10.0f - 0.5f);
-    if (tenths == 0L)
-    {
-        snprintf(buffer, size, "0.0");
-        return;
-    }
+/* Replies are built inside the 1 ms control cycle on a 16 MHz core, where each
+   snprintf call costs about 2,000 cycles; these cost a few hundred. Values are
+   clamped so every line fits the 64-byte buffers. */
+#define FORMAT_LIMIT 99999999.0f
 
-    unsigned long magnitude = tenths < 0L ?
-                              (unsigned long)(-tenths) : (unsigned long)tenths;
-    snprintf(buffer, size, "%s%lu.%lu", tenths < 0L ? "-" : "",
-             magnitude / 10UL, magnitude % 10UL);
+static long to_scaled(float value, float scale)
+{
+    float scaled = value * scale;
+
+    if (isnan(scaled))
+    {
+        return 0L;
+    }
+    if (scaled > FORMAT_LIMIT)
+    {
+        scaled = FORMAT_LIMIT;
+    }
+    if (scaled < -FORMAT_LIMIT)
+    {
+        scaled = -FORMAT_LIMIT;
+    }
+    return (long)(scaled >= 0.0f ? scaled + 0.5f : scaled - 0.5f);
+}
+
+static char *put_text(char *out, const char *text)
+{
+    while (*text != '\0')
+    {
+        *out++ = *text++;
+    }
+    return out;
+}
+
+static char *put_uint(char *out, unsigned long value)
+{
+    char digits[11];
+    int count = 0;
+
+    do
+    {
+        digits[count++] = (char)('0' + value % 10UL);
+        value /= 10UL;
+    } while (value != 0UL);
+    while (count > 0)
+    {
+        *out++ = digits[--count];
+    }
+    return out;
+}
+
+static char *put_fraction(char *out, unsigned long value, int places)
+{
+    for (int divisor_places = places - 1; divisor_places >= 0; divisor_places--)
+    {
+        unsigned long divisor = 1UL;
+        for (int i = 0; i < divisor_places; i++)
+        {
+            divisor *= 10UL;
+        }
+        *out++ = (char)('0' + (value / divisor) % 10UL);
+    }
+    return out;
+}
+
+static char *put_scaled(char *out, long scaled, unsigned long divisor, int places)
+{
+    unsigned long magnitude = scaled < 0L ? (unsigned long)(-scaled) :
+                                            (unsigned long)scaled;
+
+    if (scaled < 0L)
+    {
+        *out++ = '-';
+    }
+    out = put_uint(out, magnitude / divisor);
+    *out++ = '.';
+    return put_fraction(out, magnitude % divisor, places);
+}
+
+static char *put_tenths(char *out, float value)
+{
+    return put_scaled(out, to_scaled(value, 10.0f), 10UL, 1);
+}
+
+static char *put_hundredths(char *out, float value)
+{
+    if (isnan(value))
+    {
+        *out++ = '-';
+        return out;
+    }
+    return put_scaled(out, to_scaled(value, 100.0f), 100UL, 2);
+}
+
+static bool write_result(const protocol_response_t *response)
+{
+    char line[64];
+    char *out = put_text(line, "res ");
+
+    if (response->result_page == '\0')
+    {
+        out = put_uint(out, response->result_phase);
+        *out++ = ' ';
+        out = put_uint(out, response->result_fail);
+        for (int index = 0; index < 3; index++)
+        {
+            *out++ = ' ';
+            out = put_hundredths(out, response->result_mm[index]);
+        }
+    }
+    else
+    {
+        *out++ = response->result_page;
+        for (int index = 0; index < PROTOCOL_RESULT_VALUES; index++)
+        {
+            *out++ = ' ';
+            out = put_hundredths(out, response->result_mm[index]);
+        }
+    }
+    *out++ = '\n';
+    *out = '\0';
+    return uart_write(line);
 }
 
 bool protocol_write_response(const protocol_response_t *response)
@@ -165,9 +282,6 @@ bool protocol_write_response(const protocol_response_t *response)
         [PROTOCOL_RESPONSE_ERR_SYS] = "err sys\n",
     };
     char line[64];
-    char position[16];
-    char velocity[16];
-    char acceleration[16];
 
     if (response == 0 || response->type == PROTOCOL_RESPONSE_NONE)
     {
@@ -175,20 +289,30 @@ bool protocol_write_response(const protocol_response_t *response)
     }
     if (response->type == PROTOCOL_RESPONSE_ACK)
     {
-        format_tenth(position, sizeof(position), response->position_mm);
-        format_tenth(velocity, sizeof(velocity), response->velocity_mm_s);
-        format_tenth(acceleration, sizeof(acceleration),
-                     response->acceleration_mm_s2);
-        snprintf(line, sizeof(line), "ack %s %s %s\n",
-                 position, velocity, acceleration);
+        char *out = put_text(line, "ack ");
+        out = put_tenths(out, response->position_mm);
+        *out++ = ' ';
+        out = put_tenths(out, response->velocity_mm_s);
+        *out++ = ' ';
+        out = put_tenths(out, response->acceleration_mm_s2);
+        *out++ = '\n';
+        *out = '\0';
         return uart_write(line);
+    }
+    if (response->type == PROTOCOL_RESPONSE_RESULT)
+    {
+        return write_result(response);
     }
     if (response->type == PROTOCOL_RESPONSE_KD)
     {
         unsigned long thousandths =
             (unsigned long)(response->gain_kd * 1000.0f + 0.5f);
-        snprintf(line, sizeof(line), "kd %lu.%03lu\n",
-                 thousandths / 1000UL, thousandths % 1000UL);
+        char *out = put_text(line, "kd ");
+        out = put_uint(out, thousandths / 1000UL);
+        *out++ = '.';
+        out = put_fraction(out, thousandths % 1000UL, 3);
+        *out++ = '\n';
+        *out = '\0';
         return uart_write(line);
     }
     if ((unsigned int)response->type >=

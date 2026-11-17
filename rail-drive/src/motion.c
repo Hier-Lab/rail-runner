@@ -2,6 +2,9 @@
 
 #include <math.h>
 
+#define SETTLE_VELOCITY_BAND 0.005f
+#define SETTLE_ACCELERATION_BAND 1.0f
+
 static float clampf(float value, float minimum, float maximum)
 {
     if (value < minimum)
@@ -51,11 +54,14 @@ void motion_profile_step(float target, float *velocity, float *acceleration)
     *acceleration = clampf(*acceleration, -MAX_ACC, MAX_ACC);
     *velocity += 0.5f * (old_acceleration + *acceleration) * CONTROL_DT_S;
 
-    if (fabsf(target - *velocity) < 0.00001f &&
-        fabsf(*acceleration) <= jerk_step)
+    /* The jerk limiter moves velocity in steps of up to jerk_step * dt, so a
+       band narrower than that is never entered and the profile hunts around
+       the target forever (up to 0.0007 mm/s and 0.45 mm/s^2). */
+    if (fabsf(target - *velocity) < SETTLE_VELOCITY_BAND &&
+        fabsf(*acceleration) < SETTLE_ACCELERATION_BAND)
     {
         *velocity = target;
-        *acceleration = approach(*acceleration, 0.0f, jerk_step);
+        *acceleration = 0.0f;
     }
     *velocity = clampf(*velocity, -MAX_VEL, MAX_VEL);
 }

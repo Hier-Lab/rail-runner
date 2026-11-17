@@ -4,13 +4,11 @@
 
 #include "ak60.h"
 #include "board.h"
+#include "calibration.h"
 #include "protocol.h"
 #include "uart.h"
 
 #define HOST_TIMEOUT_MS 50U
-/* Worst case is a full-length seek at CAL_VEL (420mm / 2mm/s = 210s) plus
-   back-off and brake; 90s was too short for the flat slow-speed cal policy. */
-#define CALIBRATION_TIMEOUT_MS 270000U
 #define FEEDBACK_TIMEOUT_MS 10U
 #define OPTICAL_DEBOUNCE_CYCLES 5U
 #define TWO_PI 6.28318530718f
@@ -24,12 +22,15 @@ typedef enum
     STATE_FAULT
 } drive_state_t;
 
-typedef enum
+typedef struct
 {
-    CAL_SEEK_MIN = 0,
-    CAL_BACK_OFF,
-    CAL_BRAKE
-} calibration_phase_t;
+    bool candidate;
+    bool stable;
+    uint8_t count;
+    float candidate_position_mm;
+    /* Position at the first sample of the latest confirmed change. */
+    float edge_position_mm;
+} debounced_t;
 
 typedef enum
 {
@@ -49,7 +50,6 @@ static volatile bool overrun_pending;
 static volatile uint32_t timer_ticks;
 
 static drive_state_t state;
-static calibration_phase_t calibration_phase;
 static drive_fault_t fault;
 static drive_fault_t stop_fault;
 static float requested_velocity_mm_s;
@@ -66,22 +66,16 @@ static bool last_motor_tx_ok;
 static uint32_t feedback_sequence;
 static uint32_t last_feedback_tick;
 static uint32_t last_host_tick;
-static uint32_t calibration_start_tick;
 static ak60_state_t motor;
 
-static bool home_switch_candidate;
-static bool home_switch_stable;
-static float home_clear_position_mm;
-static uint8_t home_switch_count;
-
-static bool gate_home_candidate;
-static bool gate_home_stable;
-static uint8_t gate_home_count;
-static bool gate_far_candidate;
-static bool gate_far_stable;
-static uint8_t gate_far_count;
+static debounced_t home_switch;
+static debounced_t far_switch;
+static debounced_t gate_home;
+static debounced_t gate_far;
 static bool beyond_home_gate;
 static bool beyond_far_gate;
+/* Far switch position; the nominal MAX_POS until a calibration measures it. */
+static float travel_mm = MAX_POS;
 
 static protocol_response_type_t fault_response(drive_fault_t reason)
 {
@@ -126,30 +120,37 @@ static void begin_stop(drive_fault_t reason)
     calibration_error_pending = false;
 }
 
-static void update_home_switch(void)
+static void debounce(debounced_t *input, bool sample)
 {
-    bool sample = board_home_switch_active();
-    if (sample == home_switch_candidate)
+    if (sample == input->candidate)
     {
-        if (home_switch_count < OPTICAL_DEBOUNCE_CYCLES)
+        if (input->count < OPTICAL_DEBOUNCE_CYCLES)
         {
-            home_switch_count++;
+            input->count++;
         }
     }
     else
     {
-        home_switch_candidate = sample;
-        home_switch_count = 1U;
-        if (!sample)
-        {
-            /* Keep the edge position if this clear interval is confirmed. */
-            home_clear_position_mm = position_mm;
-        }
+        input->candidate = sample;
+        input->count = 1U;
+        /* Keep the edge position if this interval is confirmed. */
+        input->candidate_position_mm = position_mm;
     }
-    if (home_switch_count >= OPTICAL_DEBOUNCE_CYCLES)
+    if (input->count >= OPTICAL_DEBOUNCE_CYCLES &&
+        input->stable != input->candidate)
     {
-        home_switch_stable = home_switch_candidate;
+        input->stable = input->candidate;
+        input->edge_position_mm = input->candidate_position_mm;
     }
+}
+
+static void debounce_init(debounced_t *input, bool sample)
+{
+    input->candidate = sample;
+    input->stable = sample;
+    input->count = OPTICAL_DEBOUNCE_CYCLES;
+    input->candidate_position_mm = 0.0f;
+    input->edge_position_mm = 0.0f;
 }
 
 /*
@@ -159,29 +160,13 @@ static void update_home_switch(void)
  * direction of travel at that moment, so reversing inside the slot and
  * leaving the way you came in is handled correctly.
  */
-static void update_gate(bool sample, bool *candidate, uint8_t *count,
-                        bool *stable, bool *beyond, float end_sign)
+static void update_gate(debounced_t *gate, bool sample, bool *beyond,
+                        float end_sign)
 {
-    bool was_stable = *stable;
+    bool was_stable = gate->stable;
 
-    if (sample == *candidate)
-    {
-        if (*count < OPTICAL_DEBOUNCE_CYCLES)
-        {
-            (*count)++;
-        }
-    }
-    else
-    {
-        *candidate = sample;
-        *count = 1U;
-    }
-    if (*count >= OPTICAL_DEBOUNCE_CYCLES)
-    {
-        *stable = *candidate;
-    }
-
-    if (was_stable && !*stable && velocity_mm_s != 0.0f)
+    debounce(gate, sample);
+    if (was_stable && !gate->stable && velocity_mm_s != 0.0f)
     {
         *beyond = (velocity_mm_s * end_sign) > 0.0f;
     }
@@ -278,9 +263,9 @@ static float position_safe_target(float target)
     motion_profile_step(target, &candidate_velocity, &candidate_acceleration);
 
     if (candidate_velocity > 0.0f &&
-        !(position_mm >= MAX_POS - POSITION_MARGIN && target < 0.0f))
+        !(position_mm >= travel_mm - POSITION_MARGIN && target < 0.0f))
     {
-        float remaining = MAX_POS - POSITION_MARGIN - position_mm;
+        float remaining = travel_mm - POSITION_MARGIN - position_mm;
         float next_motion = 0.5f * (command_velocity_mm_s +
                                     candidate_velocity) * CONTROL_DT_S;
         if (next_motion + motion_stopping_distance(candidate_velocity,
@@ -307,7 +292,7 @@ static float position_safe_target(float target)
 static bool command_is_outward(float command)
 {
     return (command < 0.0f && position_mm <= MIN_POS + POSITION_MARGIN) ||
-           (command > 0.0f && position_mm >= MAX_POS - POSITION_MARGIN);
+           (command > 0.0f && position_mm >= travel_mm - POSITION_MARGIN);
 }
 
 /* Exact-zero equality on a value that approaches zero through float jerk
@@ -322,23 +307,38 @@ static bool profile_stopped(void)
            fabsf(command_acceleration_mm_s2) < STOPPED_ACCEL_EPS;
 }
 
+static void fill_calibration_inputs(cal_inputs_t *inputs, uint32_t now)
+{
+    const debounced_t *sources[CAL_SIGNAL_COUNT] = {
+        [CAL_SIGNAL_HOME_SWITCH] = &home_switch,
+        [CAL_SIGNAL_FAR_SWITCH] = &far_switch,
+        [CAL_SIGNAL_HOME_GATE] = &gate_home,
+        [CAL_SIGNAL_FAR_GATE] = &gate_far,
+    };
+
+    for (int id = 0; id < CAL_SIGNAL_COUNT; id++)
+    {
+        inputs->signal[id].active = sources[id]->stable;
+        inputs->signal[id].edge_mm = sources[id]->edge_position_mm;
+    }
+    inputs->position_mm = position_mm;
+    inputs->velocity_mm_s = velocity_mm_s;
+    inputs->command_velocity_mm_s = command_velocity_mm_s;
+    inputs->command_acceleration_mm_s2 = command_acceleration_mm_s2;
+    inputs->now_ms = now;
+}
+
 static void start_calibration(uint32_t now)
 {
+    cal_inputs_t inputs;
+
     state = STATE_CALIBRATING;
     position_calibrated = false;
     calibration_complete_pending = false;
     calibration_error_pending = false;
-    calibration_start_tick = now;
-    if (home_switch_stable)
-    {
-        calibration_phase = CAL_BACK_OFF;
-        requested_velocity_mm_s = CAL_BACKOFF_VEL;
-    }
-    else
-    {
-        calibration_phase = CAL_SEEK_MIN;
-        requested_velocity_mm_s = CAL_VEL;
-    }
+    requested_velocity_mm_s = 0.0f;
+    fill_calibration_inputs(&inputs, now);
+    cal_start(&inputs);
 }
 
 static bool fault_can_clear(uint32_t now)
@@ -352,6 +352,31 @@ static bool fault_can_clear(uint32_t now)
         return last_motor_tx_ok && feedback_fresh(now) && motor.error == 0U;
     }
     return true;
+}
+
+_Static_assert(CAL_EDGE_COUNT == PROTOCOL_RESULT_VALUES,
+               "a res line carries one gate's edges");
+
+static void fill_result_response(char page, protocol_response_t *response)
+{
+    cal_result_t result;
+
+    cal_get_result(&result);
+    response->type = PROTOCOL_RESPONSE_RESULT;
+    response->result_page = page;
+    response->result_phase = (uint8_t)result.phase;
+    response->result_fail = (uint8_t)result.fail;
+    for (int edge = 0; edge < CAL_EDGE_COUNT; edge++)
+    {
+        response->result_mm[edge] = page == 'h' ? result.home_gate_mm[edge] :
+                                                  result.far_gate_mm[edge];
+    }
+    if (page == '\0')
+    {
+        response->result_mm[0] = result.travel_mm;
+        response->result_mm[1] = result.far_release_mm;
+        response->result_mm[2] = result.home_press_mm;
+    }
 }
 
 static void handle_request(const protocol_request_t *request, uint32_t now,
@@ -372,6 +397,11 @@ static void handle_request(const protocol_request_t *request, uint32_t now,
     if (request->type == PROTOCOL_REQUEST_INVALID_KD)
     {
         response->type = PROTOCOL_RESPONSE_ERR_KD;
+        return;
+    }
+    if (request->type == PROTOCOL_REQUEST_RESULT)
+    {
+        fill_result_response(request->result_page, response);
         return;
     }
 
@@ -482,30 +512,37 @@ static void handle_request(const protocol_request_t *request, uint32_t now,
     }
 }
 
-static void update_calibration(void)
+static void update_calibration(uint32_t now)
 {
+    cal_inputs_t inputs;
+    cal_result_t result;
+
     if (state != STATE_CALIBRATING)
     {
         return;
     }
 
-    if (calibration_phase == CAL_SEEK_MIN && home_switch_stable)
+    fill_calibration_inputs(&inputs, now);
+    switch (cal_step(&inputs, &requested_velocity_mm_s))
     {
-        calibration_phase = CAL_BACK_OFF;
-        requested_velocity_mm_s = CAL_BACKOFF_VEL;
-    }
-    else if (calibration_phase == CAL_BACK_OFF && !home_switch_stable)
-    {
-        position_mm -= home_clear_position_mm;
-        calibration_phase = CAL_BRAKE;
-        requested_velocity_mm_s = 0.0f;
-    }
-    else if (calibration_phase == CAL_BRAKE && profile_stopped())
-    {
-        state = STATE_ACTIVE;
-        position_calibrated = true;
-        calibration_complete_pending = true;
-        requested_velocity_mm_s = 0.0f;
+        case CAL_DONE:
+            cal_get_result(&result);
+            position_mm -= cal_zero_mm();
+            travel_mm = result.travel_mm;
+            /* The run parks between the gates. */
+            beyond_home_gate = false;
+            beyond_far_gate = false;
+            state = STATE_ACTIVE;
+            position_calibrated = true;
+            calibration_complete_pending = true;
+            requested_velocity_mm_s = 0.0f;
+            break;
+        case CAL_FAILED:
+            begin_stop(FAULT_NONE);
+            calibration_error_pending = true;
+            break;
+        default:
+            break;
     }
 }
 
@@ -522,7 +559,7 @@ static bool send_motor_command(void)
 static void run_control_cycle(void)
 {
     uint32_t now = timer_ticks;
-    protocol_request_t request = {PROTOCOL_REQUEST_NONE, 0.0f, 0.0f};
+    protocol_request_t request = {PROTOCOL_REQUEST_NONE, 0.0f, 0.0f, '\0'};
     protocol_response_t response = {0};
     bool has_request = protocol_read_request(&request);
     bool was_calibrating = state == STATE_CALIBRATING;
@@ -536,16 +573,19 @@ static void run_control_cycle(void)
     {
         set_fault(FAULT_ESTOP);
     }
-    if (!board_hard_limits_ok())
+    /* Both switches are E-stop-class kills, same as the wired E-stop, except
+       in the calibration phases that deliberately ride onto them. The home
+       switch is also harmless while deactivated: it is where cal starts. */
+    if (!board_hard_limits_ok() &&
+        !(state == STATE_CALIBRATING && cal_far_switch_expected(position_mm)))
     {
-        /* Far switch: an E-stop-class kill in every state, same as the wired E-stop. */
         set_fault(FAULT_ESTOP);
     }
-    if ((state == STATE_ACTIVE || state == STATE_STOPPING) &&
-        board_home_switch_active())
+    if (board_home_switch_active() &&
+        (state == STATE_ACTIVE || state == STATE_STOPPING ||
+         (state == STATE_CALIBRATING &&
+          !cal_home_switch_expected(position_mm))))
     {
-        /* Home switch: an E-stop-class kill only outside calibration, which
-           deliberately rides onto this switch to find zero. */
         set_fault(FAULT_ESTOP);
     }
     consume_feedback(now);
@@ -553,11 +593,10 @@ static void run_control_cycle(void)
     {
         position_mm += velocity_mm_s * CONTROL_PERIOD_US / 1000000.0f;
     }
-    update_home_switch();
-    update_gate(board_gate_home_active(), &gate_home_candidate, &gate_home_count,
-               &gate_home_stable, &beyond_home_gate, -1.0f);
-    update_gate(board_gate_far_active(), &gate_far_candidate, &gate_far_count,
-               &gate_far_stable, &beyond_far_gate, 1.0f);
+    debounce(&home_switch, board_home_switch_active());
+    debounce(&far_switch, !board_hard_limits_ok());
+    update_gate(&gate_home, board_gate_home_active(), &beyond_home_gate, -1.0f);
+    update_gate(&gate_far, board_gate_far_active(), &beyond_far_gate, 1.0f);
 
     if ((state == STATE_CALIBRATING || state == STATE_ACTIVE ||
          state == STATE_STOPPING) && !feedback_fresh(now))
@@ -580,14 +619,7 @@ static void run_control_cycle(void)
         begin_stop(FAULT_COMMUNICATION);
     }
 
-    if (state == STATE_CALIBRATING &&
-        now - calibration_start_tick >= CALIBRATION_TIMEOUT_MS)
-    {
-        begin_stop(FAULT_NONE);
-        calibration_error_pending = true;
-    }
-
-    update_calibration();
+    update_calibration(now);
 
     if (state == STATE_CALIBRATING || state == STATE_ACTIVE ||
         state == STATE_STOPPING)
@@ -612,8 +644,6 @@ static void run_control_cycle(void)
             set_fault(completed_fault);
         }
     }
-
-    update_calibration();
 
     last_motor_tx_ok = send_motor_command();
     if (!last_motor_tx_ok)
@@ -646,7 +676,8 @@ static void run_control_cycle(void)
             response.type != PROTOCOL_RESPONSE_ERR_LIM &&
             response.type != PROTOCOL_RESPONSE_ERR_CMD &&
             response.type != PROTOCOL_RESPONSE_ERR_KD &&
-            response.type != PROTOCOL_RESPONSE_KD)
+            response.type != PROTOCOL_RESPONSE_KD &&
+            response.type != PROTOCOL_RESPONSE_RESULT)
         {
             response.type = fault_response(fault);
         }
@@ -664,15 +695,10 @@ void control_init(void)
 {
     state = STATE_DEACTIVATED;
     velocity_gain_kd = AK60_DEFAULT_KD;
-    home_switch_candidate = board_home_switch_active();
-    home_switch_stable = home_switch_candidate;
-    home_switch_count = OPTICAL_DEBOUNCE_CYCLES;
-    gate_home_candidate = board_gate_home_active();
-    gate_home_stable = gate_home_candidate;
-    gate_home_count = OPTICAL_DEBOUNCE_CYCLES;
-    gate_far_candidate = board_gate_far_active();
-    gate_far_stable = gate_far_candidate;
-    gate_far_count = OPTICAL_DEBOUNCE_CYCLES;
+    debounce_init(&home_switch, board_home_switch_active());
+    debounce_init(&far_switch, !board_hard_limits_ok());
+    debounce_init(&gate_home, board_gate_home_active());
+    debounce_init(&gate_far, board_gate_far_active());
     beyond_home_gate = false;
     beyond_far_gate = false;
     CoreDebug->DEMCR |= CoreDebug_DEMCR_TRCENA_Msk;

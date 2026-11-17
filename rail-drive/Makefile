@@ -55,6 +55,7 @@ SOURCES = \
     vendor/STM32CubeF4/Projects/STM32446E-Nucleo/Templates/STM32CubeIDE/Example/User/sysmem.c \
     src/ak60.c \
     src/board.c \
+    src/calibration.c \
     src/can.c \
     src/control.c \
     src/protocol.c \

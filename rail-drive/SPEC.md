@@ -15,10 +15,10 @@ Hardcoded `#define` constants
 - `MAX_JRK` 150 mm/s^3
 - `MAX_VEL` 32 mm/s
 - `MIN_POS` 0 mm
-- `MAX_POS` 420 mm
-- `POSITION_MARGIN` is 2 mm, so normal motion brakes to the 2--418 mm operating envelope. Inside either margin, only motion back toward the operating envelope is allowed.
-- `CAL_VEL` is -2 mm/s (the home-switch approach speed)
-- `CAL_BACKOFF_VEL` is 5 mm/s (the back-off speed once the home switch asserts, faster than the approach to minimize dwell time pressing on it)
+- `MAX_POS` 325 mm is the travel measured on the rig (324.9 mm to the far switch press). Each calibration replaces it with the measured far switch position.
+- `POSITION_MARGIN` is 2 mm, so normal motion brakes to an operating envelope 2 mm inside zero and 2 mm inside the measured far switch position. Inside either margin, only motion back toward the operating envelope is allowed.
+- `CAL_FAST_VEL` is 20 mm/s and is used only between the two gates (and for parking). `CAL_SLOW_VEL` and `CAL_PROBE_VEL` are 2 mm/s: everything between a gate and its switch, and the blind probe, runs slow regardless of what the run believes about where the gates and switches are (gates can be moved or replaced). `CAL_BACKOFF_VEL` is 5 mm/s (leaving a switch). A missing or misplaced gate on a fast leg ends in an `err est` at the switch at the fast speed.
+- `CAL_HOME_ZONE_MM` is 60 mm and `CAL_FAR_ZONE_MM` is 48 mm, the gate-to-switch distances measured on the rig (outer gate edge to switch press). Only the calibration budgets depend on them.
 - `PITCH` is 5 mm/rev
 - Safety limits use a time-optimal jerk-limited velocity profile
 
@@ -35,7 +35,7 @@ Generally, messages take the form:
 - `<cmd> <val>`
 - `ack <pos> <vel> <acc>` or `<status> <code>`
 
-Requests use the exact grammar `cal`, `dis`, `sp <signed-decimal>` with at most one fractional digit, or `kd <unsigned-decimal>` with at most three fractional digits.
+Requests use the exact grammar `cal`, `dis`, `sp <signed-decimal>` with at most one fractional digit, `kd <unsigned-decimal>` with at most three fractional digits, or `res`, `res h`, `res f`.
     - mm, mm/s, and mm/s^2 units
 
 ### Serial commands
@@ -43,12 +43,21 @@ Requests use the exact grammar `cal`, `dis`, `sp <signed-decimal>` with at most 
 `<rec>` <-- `<reply>`
 
 - `cal` <-- `cal` while calibrating, then `ack <pos> <vel> 0.0` when done
-    - `cal` is sent once. Calibration times out after 90 seconds with `err cal`.
-    - If the debounced home switch is clear, ramp to `CAL_VEL` (-2 mm/s) until it asserts. If already asserted, begin backing off immediately at `CAL_BACKOFF_VEL` (5 mm/s). The home switch does not fault during calibration; it is the cal target.
-    - Reverse at `CAL_BACKOFF_VEL` with the normal jerk/acceleration limits until the home switch has been clear for 5 ms. Set the firmware position origin to the first clear sample in that confirmed interval.
-    - Brake to zero commanded velocity and acceleration. Calibration completes in active zero-velocity mode at the resulting positive measured position and does not wait for measured velocity to settle.
-    - The far switch still faults (`err est`) even during calibration.
-    - Once active, the optical gates (below) act as hard stops; `cal` itself ignores them.
+    - `cal` is sent once. The run sweeps the whole rail and touches both switches, in the numbered phases below. Phase 5 of the original proposal is not run.
+    - 1, probe: move toward home at `CAL_PROBE_VEL`. The home switch asserting goes to phase 4, the home gate being blocked goes to phase 3, and the far gate clearing or `CAL_PROBE_BUDGET_MM` (80 mm) of travel goes to phase 2. A run that starts on the home switch begins at phase 4, and one that starts with the home gate blocked begins at phase 3.
+    - 2, fast home: `CAL_FAST_VEL` toward home until the home gate is blocked.
+    - 3, slow home: `CAL_SLOW_VEL` toward home until the home switch asserts.
+    - 4, back off home: `CAL_BACKOFF_VEL` away from home until the switch has been clear for 5 ms. Zero is the first clear sample in that confirmed interval.
+    - 6, fast far: `CAL_FAST_VEL` away from home until the far gate is blocked.
+    - 7, slow far: `CAL_SLOW_VEL` until the far switch asserts. That position is the travel length.
+    - 8, back off far: `CAL_BACKOFF_VEL` toward home until the far switch is clear.
+    - 9, park: move to 10 mm on the home side of the far gate and brake to zero. Calibration completes there in active zero-velocity mode.
+    - A phase fails with `err cal` if it travels past its distance budget, takes longer than 1.5 times that distance should take plus 3 s, or the carriage moves at under a quarter of the commanded speed for 500 ms. The budgets are 80 mm for the probe, 90 mm for a slow phase, 10 mm for a back-off, and 360 mm for a fast phase or the park.
+    - The home switch does not fault in phases 1, 3, and 4, nor in phase 6 until the carriage is 2 mm past zero. The far switch does not fault in phases 7 and 8, nor in phase 9 until the carriage is 2 mm off it. In every other phase either switch faults `err est`, which is how a dead gate ends: the fast leg reaches the switch behind it.
+    - Once active, the optical gates (below) act as hard stops.
+- `res` <-- `res <phase> <fail> <travel> <far-release> <home-press>` for the latest calibration, running, finished, or failed. `<phase>` is the phase number above, or 10 when done. `<fail>` is 0 for none, 1 for a distance budget, 2 for a time budget, 3 for a stall. Positions are in mm from zero with two fractional digits, or `-` if not measured.
+- `res h` and `res f` <-- `res h|f <lead-in> <trail-in> <trail-out> <lead-out>`, the positions of the home or far gate's edges. "In" is travel toward that gate's own end, and the leading edge is the one met first on the way in.
+    - `res` is accepted in every state, and does not refresh the host watchdog or alter the current state.
 - `dis` <-- `dis` immediately. `dis` is sent once. Continue with a jerk-limited stop, switch to the all-zero MIT command, invalidate calibration, and enter the deactivated state.
 - `sp <vel>` <-- `ack <pos> <vel> <acc>`. Valid commands refresh a 50 ms watchdog, but the watchdog is only armed while the last requested velocity is nonzero. A host that goes silent while actively commanding motion times out and triggers `err com`; a host that has already requested zero (holding, including the hold `cal` leaves you in) can disconnect indefinitely without faulting or losing calibration, so a run can be split across several separate host sessions as long as each new session only reconnects while the carriage is holding.
 - `kd <gain>` <-- `kd <gain>` formatted to three fractional digits. Values from 0 through 1.000 are accepted in every state, apply immediately, persist until MCU reset, and do not refresh the host watchdog or alter the current state. Malformed and out-of-range values return nonfatal `err kd` without changing the gain.
@@ -58,12 +67,12 @@ Requests use the exact grammar `cal`, `dis`, `sp <signed-decimal>` with at most 
 
 | Error | Cause | Response | Fatal? |
 |---|---|---|---|
-| `err cal` | Non-`cal` during calibration | Deactivate | No |
+| `err cal` | Non-`cal` during calibration, or a calibration phase over budget or stalled | Deactivate | No |
 | `err dis` | Non-`cal` while deactivated | Stay deactivated | No |
 | `err lim` | Setpoint exceeds velocity limit | Deactivate | Yes |
 | `err hrd` | Retired; no longer produced (see below) | n/a | n/a |
 | `err est` | Wired E-stop pressed, far switch tripped (any state), or home switch tripped (while active or stopping) | Disable motor | Yes |
-| `err pos` | Motion farther outside 2--418 mm | Hold zero; allow inward motion | No |
+| `err pos` | Motion farther outside the operating envelope | Hold zero; allow inward motion | No |
 | `err com` | Host command timeout while still commanding nonzero velocity | Limited stop; deactivate | Yes |
 | `err mot` | CubeMars fault | Send all-zero MIT command | Yes |
 | `err can` | TX failure or 10 ms feedback loss | Send all-zero MIT command | Yes |
@@ -76,13 +85,13 @@ All fatal faults invalidate calibration.
 Fault priority is estop, system, motor, CAN, velocity limit, communication, then calibration/state/parser errors. A healthy `dis` clears a pending firmware fault without first reporting it, and additionally requires the E-stop, far switch, and home switch to all currently read healthy; motor and CAN faults require fresh fault-free feedback. There is no direct-to-`cal` recovery shortcut from a fault: estop recovery (wired E-stop, far switch, or home switch) always requires physical reset, `dis`, and a new calibration.
 
 The mechanical home and far switches are E-stop-class safety inputs, the same severity and recovery path as the wired E-stop, not a separate hard-limit class:
-- The home switch (normally-open, active-low) is sensed on PC8. It is the calibration target — `cal` rides onto and off it to find zero, and it does not fault during calibration — but once active or stopping, pressing it faults `err est`.
-- The far switch (normally-open, active-low) is sensed on PC9 and faults `err est` unconditionally, in every state including calibration.
+- The home switch (normally-open, active-low) is sensed on PC8. `cal` rides onto and off it to find zero, so it does not fault in the calibration phases that approach it or while deactivated. In the other calibration phases and once active or stopping, pressing it faults `err est`.
+- The far switch (normally-open, active-low) is sensed on PC9. `cal` rides onto and off it to measure the travel length, so it does not fault in the calibration phases that approach it. In every other state and phase it faults `err est`, and a pressed far switch still blocks starting `cal`.
 - The normally-closed estop relay chain is sensed on PA1, independent of and in addition to the two switches.
 
-All three switches/relay remove motor power while leaving the Nucleo powered. Emergency inputs are acted on immediately, undebounced; the home switch's calibration-target debounce (5 ms) is separate and only affects when `cal` treats it as settled, not how fast it can fault during active/stopping.
+The wired estop relay chain removes motor power while leaving the Nucleo powered. The home and far switches do not cut motor power in hardware (confirmed 2026-11-17): the firmware is the only thing that acts on them, so they protect only while the control loop is running. Emergency inputs are acted on immediately, undebounced; the home switch's calibration-target debounce (5 ms) is separate and only affects when `cal` treats it as settled, not how fast it can fault during active/stopping.
 
-Two optical gates are hard stops, not faults. The home-side gate is sensed on PC10 and the far-side gate on PC11 (both active-high, pulled down so a disconnected or dead sensor reads as clear). Once the carriage has passed fully through a gate moving toward that gate's end, further motion toward that end commands zero — the normal jerk-limited profile brakes it to a halt, in `STATE_ACTIVE`, with no fault and no `err` reply. Motion back away from that end is unrestricted, and `cal` ignores both gates entirely. Reversing direction while still inside a gate's slot is handled: which side of the gate the carriage ends up on is decided by its direction of travel at the moment it leaves the slot, not the direction it entered. Gate inputs are debounced for 5 ms.
+Two optical gates are hard stops, not faults. The home-side gate is sensed on PC10 and the far-side gate on PC11 (both active-high, pulled down so a disconnected or dead sensor reads as clear). Once the carriage has passed fully through a gate moving toward that gate's end, further motion toward that end commands zero — the normal jerk-limited profile brakes it to a halt, in `STATE_ACTIVE`, with no fault and no `err` reply. Motion back away from that end is unrestricted. `cal` does not hard-stop at the gates; it uses them to switch from its fast speed to its slow speed. Reversing direction while still inside a gate's slot is handled: which side of the gate the carriage ends up on is decided by its direction of travel at the moment it leaves the slot, not the direction it entered. Gate inputs are debounced for 5 ms.
 
 ### Hotloop
 
@@ -90,7 +99,7 @@ This communication protocol runs inside a single nonblocking hotloop released by
 
 1) read protocol
 2) read safety info
-    - if the E-stop, far switch, or (while active/stopping) home switch is tripped, kill (`err est`)
+    - if the E-stop is tripped, or a switch is tripped outside the calibration phases that ride onto it, kill (`err est`)
     - if a fatal fault is present, send the all-zero MIT command
 3) read state info
     - read motor feedback position and velocity

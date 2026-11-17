@@ -11,8 +11,8 @@ make debug                  # debug the drive board with gdb-multiarch
 ```
 
 Rail position integrates measured CAN velocity at the 1 kHz control rate,
-using 5 mm of travel per output-shaft revolution. Calibration times out after
-90 seconds. The motor's existing CAN configuration is used without modification.
+using 5 mm of travel per output-shaft revolution. Calibration sweeps the whole
+rail, touches both switches, and reports what it measured through `res`. The motor's existing CAN configuration is used without modification.
 
 Host-side checks:
 ```sh

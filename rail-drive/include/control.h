@@ -9,10 +9,9 @@
 #define CONTROL_PERIOD_US 1000U
 
 #define MIN_POS 0.0f
-#define MAX_POS 420.0f
+/* Measured travel (far switch press, 324.9 mm); replaced by each calibration. */
+#define MAX_POS 325.0f
 #define POSITION_MARGIN 2.0f
-#define CAL_VEL (-2.0f)
-#define CAL_BACKOFF_VEL 5.0f
 #define PITCH 5.0f
 #define MOTOR_DIRECTION 1.0f
 
