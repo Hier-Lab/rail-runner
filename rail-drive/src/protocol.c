@@ -233,6 +233,14 @@ static char *put_hundredths(char *out, float value)
     return put_scaled(out, to_scaled(value, 100.0f), 100UL, 2);
 }
 
+/* Terminates the line built from line..end and queues it. */
+static bool send_line(char *line, char *end)
+{
+    *end++ = '\n';
+    *end = '\0';
+    return uart_write(line);
+}
+
 static bool write_result(const protocol_response_t *response)
 {
     char line[64];
@@ -258,9 +266,7 @@ static bool write_result(const protocol_response_t *response)
             out = put_hundredths(out, response->result_mm[index]);
         }
     }
-    *out++ = '\n';
-    *out = '\0';
-    return uart_write(line);
+    return send_line(line, out);
 }
 
 bool protocol_write_response(const protocol_response_t *response)
@@ -271,7 +277,6 @@ bool protocol_write_response(const protocol_response_t *response)
         [PROTOCOL_RESPONSE_ERR_CAL] = "err cal\n",
         [PROTOCOL_RESPONSE_ERR_DIS] = "err dis\n",
         [PROTOCOL_RESPONSE_ERR_LIM] = "err lim\n",
-        [PROTOCOL_RESPONSE_ERR_HRD] = "err hrd\n",
         [PROTOCOL_RESPONSE_ERR_EST] = "err est\n",
         [PROTOCOL_RESPONSE_ERR_POS] = "err pos\n",
         [PROTOCOL_RESPONSE_ERR_COM] = "err com\n",
@@ -295,9 +300,7 @@ bool protocol_write_response(const protocol_response_t *response)
         out = put_tenths(out, response->velocity_mm_s);
         *out++ = ' ';
         out = put_tenths(out, response->acceleration_mm_s2);
-        *out++ = '\n';
-        *out = '\0';
-        return uart_write(line);
+        return send_line(line, out);
     }
     if (response->type == PROTOCOL_RESPONSE_RESULT)
     {
@@ -311,9 +314,7 @@ bool protocol_write_response(const protocol_response_t *response)
         out = put_uint(out, thousandths / 1000UL);
         *out++ = '.';
         out = put_fraction(out, thousandths % 1000UL, 3);
-        *out++ = '\n';
-        *out = '\0';
-        return uart_write(line);
+        return send_line(line, out);
     }
     if ((unsigned int)response->type >=
         sizeof(fixed) / sizeof(fixed[0]) || fixed[response->type] == 0)

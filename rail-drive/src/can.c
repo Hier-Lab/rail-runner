@@ -5,8 +5,6 @@
 #include "board.h"
 
 static CAN_HandleTypeDef hcan1;
-static volatile uint32_t tx_ok_count;
-static volatile uint32_t tx_fail_count;
 static can_frame_t latest_frame;
 static volatile uint32_t latest_sequence;
 
@@ -73,14 +71,7 @@ bool can_send(uint32_t id, const uint8_t *data, uint8_t len)
     header.DLC = len;
     header.TransmitGlobalTime = DISABLE;
 
-    if (HAL_CAN_AddTxMessage(&hcan1, &header, payload, &mailbox) == HAL_OK)
-    {
-        tx_ok_count++;
-        return true;
-    }
-
-    tx_fail_count++;
-    return false;
+    return HAL_CAN_AddTxMessage(&hcan1, &header, payload, &mailbox) == HAL_OK;
 }
 
 bool can_read_latest(can_frame_t *frame, uint32_t *sequence)
@@ -132,21 +123,4 @@ void HAL_CAN_RxFifo0MsgPendingCallback(CAN_HandleTypeDef *hcan)
         latest_frame = frame;
         latest_sequence++;
     }
-}
-
-void can_get_status(can_status_t *status)
-{
-    if (status == 0)
-    {
-        return;
-    }
-
-    status->error = HAL_CAN_GetError(&hcan1);
-    status->state = (uint32_t)HAL_CAN_GetState(&hcan1);
-    status->tx_mailboxes_free = HAL_CAN_GetTxMailboxesFreeLevel(&hcan1);
-    status->rx_fifo0_pending = HAL_CAN_GetRxFifoFillLevel(&hcan1, CAN_RX_FIFO0);
-    status->tx_error_count = (CAN1->ESR & CAN_ESR_TEC) >> CAN_ESR_TEC_Pos;
-    status->rx_error_count = (CAN1->ESR & CAN_ESR_REC) >> CAN_ESR_REC_Pos;
-    status->last_tx_ok = tx_ok_count;
-    status->last_tx_fail = tx_fail_count;
 }

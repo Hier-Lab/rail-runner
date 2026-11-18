@@ -6,7 +6,6 @@
 
 #define TIME_BUDGET_SCALE 1.5f
 #define TIME_BUDGET_SLACK_MS 3000U
-#define STOPPED_EPS 0.0001f
 
 typedef enum
 {
@@ -152,8 +151,8 @@ static void update_park(const cal_inputs_t *inputs)
         parking_brake = true;
     }
     if (parking_brake &&
-        fabsf(inputs->command_velocity_mm_s) < STOPPED_EPS &&
-        fabsf(inputs->command_acceleration_mm_s2) < STOPPED_EPS)
+        motion_is_stopped(inputs->command_velocity_mm_s,
+                          inputs->command_acceleration_mm_s2))
     {
         phase = CAL_PHASE_DONE;
     }

@@ -1,5 +1,7 @@
 #include "ak60.h"
 
+#include "mathutil.h"
+
 #define AK60_PACKET_MIT 8U
 #define AK60_PACKET_FEEDBACK 0x29U
 #define AK60_P_MIN (-12.56f)
@@ -12,19 +14,6 @@
 #define AK60_KP_MAX 500.0f
 #define AK60_KD_MIN 0.0f
 #define AK60_KD_MAX 5.0f
-
-static float clampf(float value, float minimum, float maximum)
-{
-    if (value < minimum)
-    {
-        return minimum;
-    }
-    if (value > maximum)
-    {
-        return maximum;
-    }
-    return value;
-}
 
 static uint16_t float_to_uint(float value, float minimum, float maximum,
                               uint8_t bits)

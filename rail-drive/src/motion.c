@@ -2,21 +2,14 @@
 
 #include <math.h>
 
+#include "mathutil.h"
+
 #define SETTLE_VELOCITY_BAND 0.005f
 #define SETTLE_ACCELERATION_BAND 1.0f
-
-static float clampf(float value, float minimum, float maximum)
-{
-    if (value < minimum)
-    {
-        return minimum;
-    }
-    if (value > maximum)
-    {
-        return maximum;
-    }
-    return value;
-}
+/* Exact-zero equality on a value that approaches zero through float jerk
+   limiting rarely lands on the exact bit pattern, so a stop could hang short
+   of done indefinitely; a small tolerance is the fix. */
+#define STOPPED_EPS 0.0001f
 
 static float approach(float value, float target, float maximum_step)
 {
@@ -29,6 +22,11 @@ static float approach(float value, float target, float maximum_step)
         return value - maximum_step;
     }
     return target;
+}
+
+bool motion_is_stopped(float velocity, float acceleration)
+{
+    return fabsf(velocity) < STOPPED_EPS && fabsf(acceleration) < STOPPED_EPS;
 }
 
 void motion_profile_step(float target, float *velocity, float *acceleration)

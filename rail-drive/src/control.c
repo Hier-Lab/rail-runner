@@ -36,7 +36,6 @@ typedef enum
 {
     FAULT_NONE = 0,
     FAULT_ESTOP,
-    FAULT_HARD_LIMIT,
     FAULT_SYSTEM,
     FAULT_MOTOR,
     FAULT_CAN,
@@ -58,7 +57,6 @@ static float command_acceleration_mm_s2;
 static float position_mm;
 static float velocity_mm_s;
 static float velocity_gain_kd;
-static bool position_calibrated;
 static bool calibration_complete_pending;
 static bool calibration_error_pending;
 static bool feedback_seen;
@@ -82,7 +80,6 @@ static protocol_response_type_t fault_response(drive_fault_t reason)
     switch (reason)
     {
         case FAULT_ESTOP: return PROTOCOL_RESPONSE_ERR_EST;
-        case FAULT_HARD_LIMIT: return PROTOCOL_RESPONSE_ERR_HRD;
         case FAULT_SYSTEM: return PROTOCOL_RESPONSE_ERR_SYS;
         case FAULT_MOTOR: return PROTOCOL_RESPONSE_ERR_MOT;
         case FAULT_CAN: return PROTOCOL_RESPONSE_ERR_CAN;
@@ -90,6 +87,21 @@ static protocol_response_type_t fault_response(drive_fault_t reason)
         case FAULT_COMMUNICATION: return PROTOCOL_RESPONSE_ERR_COM;
         default: return PROTOCOL_RESPONSE_NONE;
     }
+}
+
+/* A stop or fault drops any host request and any calibration reply that was
+   still waiting to be sent. */
+static void drop_pending_motion(void)
+{
+    requested_velocity_mm_s = 0.0f;
+    calibration_complete_pending = false;
+    calibration_error_pending = false;
+}
+
+static bool state_is_moving(void)
+{
+    return state == STATE_CALIBRATING || state == STATE_ACTIVE ||
+           state == STATE_STOPPING;
 }
 
 static void set_fault(drive_fault_t reason)
@@ -104,20 +116,14 @@ static void set_fault(drive_fault_t reason)
     }
     state = STATE_FAULT;
     stop_fault = FAULT_NONE;
-    requested_velocity_mm_s = 0.0f;
-    position_calibrated = false;
-    calibration_complete_pending = false;
-    calibration_error_pending = false;
+    drop_pending_motion();
 }
 
 static void begin_stop(drive_fault_t reason)
 {
     state = STATE_STOPPING;
     stop_fault = reason;
-    requested_velocity_mm_s = 0.0f;
-    position_calibrated = false;
-    calibration_complete_pending = false;
-    calibration_error_pending = false;
+    drop_pending_motion();
 }
 
 static void debounce(debounced_t *input, bool sample)
@@ -243,6 +249,20 @@ static bool calibration_preflight_ok(uint32_t now,
     return true;
 }
 
+/* True when the next step plus the jerk-limited stopping distance reaches the
+   end of the operating envelope. Velocities and acceleration are taken toward
+   that end. */
+static bool must_stop_before_end(float remaining_mm, float velocity,
+                                 float candidate_velocity,
+                                 float candidate_acceleration)
+{
+    float next_motion = 0.5f * (velocity + candidate_velocity) * CONTROL_DT_S;
+
+    return next_motion + motion_stopping_distance(candidate_velocity,
+                                                   candidate_acceleration) >=
+           remaining_mm;
+}
+
 static float position_safe_target(float target)
 {
     /* Gate hard stops: once past an end's gate, motion further toward that
@@ -262,29 +282,23 @@ static float position_safe_target(float target)
     float candidate_acceleration = command_acceleration_mm_s2;
     motion_profile_step(target, &candidate_velocity, &candidate_acceleration);
 
+    /* The home end is the far end seen in a mirrored frame, so both ends share
+       one test with the velocities flipped. */
     if (candidate_velocity > 0.0f &&
-        !(position_mm >= travel_mm - POSITION_MARGIN && target < 0.0f))
+        !(position_mm >= travel_mm - POSITION_MARGIN && target < 0.0f) &&
+        must_stop_before_end(travel_mm - POSITION_MARGIN - position_mm,
+                             command_velocity_mm_s, candidate_velocity,
+                             candidate_acceleration))
     {
-        float remaining = travel_mm - POSITION_MARGIN - position_mm;
-        float next_motion = 0.5f * (command_velocity_mm_s +
-                                    candidate_velocity) * CONTROL_DT_S;
-        if (next_motion + motion_stopping_distance(candidate_velocity,
-                                                    candidate_acceleration) >= remaining)
-        {
-            return 0.0f;
-        }
+        return 0.0f;
     }
-    else if (candidate_velocity < 0.0f &&
-             !(position_mm <= MIN_POS + POSITION_MARGIN && target > 0.0f))
+    if (candidate_velocity < 0.0f &&
+        !(position_mm <= MIN_POS + POSITION_MARGIN && target > 0.0f) &&
+        must_stop_before_end(position_mm - (MIN_POS + POSITION_MARGIN),
+                             -command_velocity_mm_s, -candidate_velocity,
+                             -candidate_acceleration))
     {
-        float remaining = position_mm - (MIN_POS + POSITION_MARGIN);
-        float next_motion = -0.5f * (command_velocity_mm_s +
-                                     candidate_velocity) * CONTROL_DT_S;
-        if (next_motion + motion_stopping_distance(-candidate_velocity,
-                                                    -candidate_acceleration) >= remaining)
-        {
-            return 0.0f;
-        }
+        return 0.0f;
     }
     return target;
 }
@@ -293,18 +307,6 @@ static bool command_is_outward(float command)
 {
     return (command < 0.0f && position_mm <= MIN_POS + POSITION_MARGIN) ||
            (command > 0.0f && position_mm >= travel_mm - POSITION_MARGIN);
-}
-
-/* Exact-zero equality on a value that approaches zero through float jerk
-   limiting rarely lands on the exact bit pattern, so stops could hang
-   short of STATE_DEACTIVATED indefinitely. A small tolerance is the fix. */
-#define STOPPED_VELOCITY_EPS 0.0001f
-#define STOPPED_ACCEL_EPS 0.0001f
-
-static bool profile_stopped(void)
-{
-    return fabsf(command_velocity_mm_s) < STOPPED_VELOCITY_EPS &&
-           fabsf(command_acceleration_mm_s2) < STOPPED_ACCEL_EPS;
 }
 
 static void fill_calibration_inputs(cal_inputs_t *inputs, uint32_t now)
@@ -333,10 +335,7 @@ static void start_calibration(uint32_t now)
     cal_inputs_t inputs;
 
     state = STATE_CALIBRATING;
-    position_calibrated = false;
-    calibration_complete_pending = false;
-    calibration_error_pending = false;
-    requested_velocity_mm_s = 0.0f;
+    drop_pending_motion();
     fill_calibration_inputs(&inputs, now);
     cal_start(&inputs);
 }
@@ -377,6 +376,18 @@ static void fill_result_response(char page, protocol_response_t *response)
         response->result_mm[1] = result.far_release_mm;
         response->result_mm[2] = result.home_press_mm;
     }
+}
+
+/* Replies that say nothing about drive health are sent as they are even while
+   a fault is latched; every other reply becomes the fault's own error. */
+static bool survives_fault(protocol_response_type_t type)
+{
+    return type == PROTOCOL_RESPONSE_ERR_CAL ||
+           type == PROTOCOL_RESPONSE_ERR_LIM ||
+           type == PROTOCOL_RESPONSE_ERR_CMD ||
+           type == PROTOCOL_RESPONSE_ERR_KD ||
+           type == PROTOCOL_RESPONSE_KD ||
+           type == PROTOCOL_RESPONSE_RESULT;
 }
 
 static void handle_request(const protocol_request_t *request, uint32_t now,
@@ -533,7 +544,6 @@ static void update_calibration(uint32_t now)
             beyond_home_gate = false;
             beyond_far_gate = false;
             state = STATE_ACTIVE;
-            position_calibrated = true;
             calibration_complete_pending = true;
             requested_velocity_mm_s = 0.0f;
             break;
@@ -598,8 +608,7 @@ static void run_control_cycle(void)
     update_gate(&gate_home, board_gate_home_active(), &beyond_home_gate, -1.0f);
     update_gate(&gate_far, board_gate_far_active(), &beyond_far_gate, 1.0f);
 
-    if ((state == STATE_CALIBRATING || state == STATE_ACTIVE ||
-         state == STATE_STOPPING) && !feedback_fresh(now))
+    if (state_is_moving() && !feedback_fresh(now))
     {
         set_fault(FAULT_CAN);
     }
@@ -621,8 +630,7 @@ static void run_control_cycle(void)
 
     update_calibration(now);
 
-    if (state == STATE_CALIBRATING || state == STATE_ACTIVE ||
-        state == STATE_STOPPING)
+    if (state_is_moving())
     {
         float target = state == STATE_ACTIVE ?
                        position_safe_target(requested_velocity_mm_s) :
@@ -631,7 +639,8 @@ static void run_control_cycle(void)
                             &command_acceleration_mm_s2);
     }
 
-    if (state == STATE_STOPPING && profile_stopped())
+    if (state == STATE_STOPPING &&
+        motion_is_stopped(command_velocity_mm_s, command_acceleration_mm_s2))
     {
         if (stop_fault == FAULT_NONE)
         {
@@ -671,13 +680,7 @@ static void run_control_cycle(void)
 
     if (has_request || response.type != PROTOCOL_RESPONSE_NONE)
     {
-        if (fault != FAULT_NONE &&
-            response.type != PROTOCOL_RESPONSE_ERR_CAL &&
-            response.type != PROTOCOL_RESPONSE_ERR_LIM &&
-            response.type != PROTOCOL_RESPONSE_ERR_CMD &&
-            response.type != PROTOCOL_RESPONSE_ERR_KD &&
-            response.type != PROTOCOL_RESPONSE_KD &&
-            response.type != PROTOCOL_RESPONSE_RESULT)
+        if (fault != FAULT_NONE && !survives_fault(response.type))
         {
             response.type = fault_response(fault);
         }
